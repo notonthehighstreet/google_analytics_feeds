@@ -1,7 +1,4 @@
-require 'ox'
-require 'addressable/uri'
-require 'stringio'
-require 'faraday'
+require "google/api_client"
 
 # @api public
 module GoogleAnalyticsFeeds
@@ -15,37 +12,49 @@ module GoogleAnalyticsFeeds
   # @api public
   class HttpError < StandardError ; end
 
+  # @api private
+  API_VERSION = 'v3'
+
   # A Google Analytics session, used to retrieve reports.
   # @api public
   class Session
     # @api private
-    CLIENT_LOGIN_URI = "https://www.google.com/accounts/ClientLogin"
+    SCOPES = ['https://www.googleapis.com/auth/analytics.readonly'].freeze
 
     # Creates a new session.
-    #
-    # Optionally pass a Faraday connection, otherwise uses the default
-    # Faraday connection.
-    def initialize(connection=Faraday.default_connection)
-      @connection = connection
+    def initialize(project)
+      @project = project
+      @authorized = false
     end
 
-    # Log in to Google Analytics with username and password
+    # Log in to Google Analytics using a service account and a key file
     #
     # This should be done before attempting to fetch any reports.
-    def login(username, password)
-      return @token if @token
-      response = @connection.post(CLIENT_LOGIN_URI,
-                                  'Email'       => username,
-                                  'Passwd'      => password,
-                                  'accountType' => 'HOSTED_OR_GOOGLE',
-                                  'service'     => 'analytics',
-                                  'source'      => 'ruby-google-analytics-feeds')
+    def login(service_account, pkcs12_key_file)
+      return @client if @client
 
-      if response.success?
-        @token = response.body.match(/^Auth=(.*)$/)[1]
-      else
-        raise AuthenticationError
-      end
+      key = Google::APIClient::KeyUtils.
+        load_from_pkcs12(pkcs12_key_file, 'notasecret')
+
+      auth = Signet::OAuth2::Client.
+        new(:token_credential_uri => 'https://accounts.google.com/o/oauth2/token',
+            :audience => 'https://accounts.google.com/o/oauth2/token',
+            :scope => SCOPES.join(' '),
+            :issuer => service_account,
+            :signing_key => key)
+
+      @client = Google::APIClient.new(:authorization => auth,
+                                     :application_name => "ruby-google-analytics-feeds",
+                                     :application_version => "1.1.0")
+    end
+
+    def authorize
+      @client.authorization.fetch_access_token!
+      @authorized = true
+    end
+
+    def discover_api
+      @analytics = @client.discovered_api('analytics', API_VERSION)
     end
 
     # Retrieve a report from Google Analytics.
@@ -54,10 +63,13 @@ module GoogleAnalyticsFeeds
     # instance or a block.
     def fetch_report(report, handler=nil, &block)
       handler  = block if handler.nil?
-      response = report.retrieve(@token, @connection)
 
+      authorize unless @authorized
+      discover_api unless @analytics
+
+      response = report.retrieve(@client, @analytics)
       if response.success?
-        DataFeedParser.new(handler).parse_rows(StringIO.new(response.body))
+        DataFeedParser.new(handler).parse_rows(response.data)
       else
         raise HttpError.new
       end
@@ -72,24 +84,12 @@ module GoogleAnalyticsFeeds
   # @abstract
   # @api public
   class RowHandler
-    # Called before any row is parsed.
-    #
-    # By default, does nothing.
-    def start_rows
-    end
-
     # Called when each row is parsed.
     #
     # By default, does nothing.
     #
     # @param row Hash
     def row(row)
-    end
-
-    # Called after all rows have been parsed.
-    #
-    # By default, does nothing.
-    def end_rows
     end
   end
   
@@ -116,59 +116,16 @@ module GoogleAnalyticsFeeds
     end
   end
 
-  # Parses rows from the GA feed via SAX. Clients shouldn't have to
-  # use this - use a RowHandler instead.
-  #
   # @api private
-  class RowParser < ::Ox::Sax
+  class RowParser
     include Naming
 
-    def initialize(handler)
-      @handler = handler
+    def initialize(header)
+      @header = header.map { |h| name_to_symbol(h) }
     end
 
-    def start_element(element)
-      case element
-
-      when :entry
-        @row = {}
-      when :"dxp:dimension", :"dxp:metric"
-        @property = {}
-      end
-    end
-
-    def attr(name, value)
-      if @property
-        @property[name] = value
-      end
-    end
-
-    def end_element(element)
-      case element
-      when :entry
-        handle_complete_row
-        @row = nil
-      when :"dxp:dimension", :"dxp:metric"
-        handle_complete_property
-        @property = nil
-      end
-    end
-    
-    private
-
-    def handle_complete_row
-      @handler.row(@row)
-    end
-
-    def handle_complete_property
-      if @row
-        value = @property[:value]
-        if @property[:type] == "integer"
-          value = Integer(value)
-        end
-        name = name_to_symbol(@property[:name])
-        @row[name] = value
-      end
+    def parse(row)
+      Hash[row.map.with_index { |val, i| [@header[i].to_sym, val] }]
     end
   end
 
@@ -240,8 +197,6 @@ module GoogleAnalyticsFeeds
   class DataFeed
     include Naming
     
-    BASE_URI = "https://www.googleapis.com/analytics/v2.4/data"
-
     def initialize
       @params = {}
     end
@@ -353,21 +308,11 @@ module GoogleAnalyticsFeeds
       }
     end
 
-    # Returns the URI string needed to retrieve this report.
-    def uri
-      uri = Addressable::URI.parse(BASE_URI)
-      uri.query_values = @params
-      uri.to_s.gsub("%40", "@")
-    end
-
-    alias :to_s :uri
-
     # @api private
-    def retrieve(session_token, connection)
-      connection.get(uri) do |request|
-        request.headers['Authorization'] = 
-          "GoogleLogin auth=#{session_token}"
-      end
+    def retrieve(client, analytics)
+      client.execute(
+        :api_method => analytics.data.ga.get,
+        :parameters => @params)
     end
 
     # @api private
@@ -393,20 +338,13 @@ module GoogleAnalyticsFeeds
   # @api private
   class DataFeedParser
     def initialize(handler)
-      if handler.kind_of?(Proc)
-        @handler = Class.new(RowHandler, &handler).new
-      elsif handler.kind_of?(Class)
-        @handler = handler.new
-      else
-        @handler = handler
-      end
+      @handler = handler
     end
 
-    # Parse rows from an IO object.
-    def parse_rows(io)
-      @handler.start_rows
-      Ox.sax_parse(RowParser.new(@handler), io)
-      @handler.end_rows
+    # Parse rows from a result object.
+    def parse_rows(data)
+      header = data.column_headers.map { |c| c.name.gsub("ga:","") }
+      data.rows.map { |row| @handler.row(RowParser.new(header).parse(row)) }
     end
   end
 end
