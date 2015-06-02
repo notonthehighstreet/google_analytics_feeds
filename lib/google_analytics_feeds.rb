@@ -30,11 +30,11 @@ module GoogleAnalyticsFeeds
     # Log in to Google Analytics using a service account and a key file
     #
     # This should be done before attempting to fetch any reports.
-    def login(service_account, pkcs12_key_file)
+    def login(service_account, pem_key_file)
       return @client if @client
 
       key = Google::APIClient::KeyUtils.
-        load_from_pkcs12(pkcs12_key_file, 'notasecret')
+        load_from_pem(pem_key_file, 'notasecret')
 
       auth = Signet::OAuth2::Client.
         new(:token_credential_uri => 'https://accounts.google.com/o/oauth2/token',
