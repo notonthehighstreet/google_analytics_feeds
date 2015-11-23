@@ -45,7 +45,8 @@ module GoogleAnalyticsFeeds
 
       @client = Google::APIClient.new(:authorization => auth,
                                      :application_name => "ruby-google-analytics-feeds",
-                                     :application_version => "1.1.0")
+                                     :application_version => "1.1.0",
+                                     :faraday_option => {:timeout => 360})
     end
 
     def authorize
