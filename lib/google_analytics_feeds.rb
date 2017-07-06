@@ -69,11 +69,7 @@ module GoogleAnalyticsFeeds
       discover_api unless @analytics
 
       response = report.retrieve(@client, @analytics)
-      if response.success?
-        DataFeedParser.new(handler).parse_rows(response.data)
-      else
-        raise HttpError.new
-      end
+      DataFeedParser.new(handler).parse_rows(response.data)
     end
   end
 
@@ -311,7 +307,7 @@ module GoogleAnalyticsFeeds
 
     # @api private
     def retrieve(client, analytics)
-      client.execute(
+      client.execute!(
         :api_method => analytics.data.ga.get,
         :parameters => @params)
     end
